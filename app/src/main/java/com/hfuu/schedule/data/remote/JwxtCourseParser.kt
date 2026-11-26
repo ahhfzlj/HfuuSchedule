@@ -46,52 +46,86 @@ object JwxtCourseParser {
         prettyPrint = true
     }
 
+    private fun normalizeRoom(raw: String): String {
+        val cleaned = raw.trim().replace(Regex("\\s+"), " ")
+        return if (cleaned.isBlank() || cleaned == "待定教室") "" else cleaned
+    }
+
+    private fun normalizeWeeks(raw: List<Int>): List<Int> {
+        return raw.filter { it in 1..30 }.distinct().sorted().ifEmpty { (1..16).toList() }
+    }
+
     fun parseFromBridgeJson(rawJson: String): Result<JwxtImportResult> = runCatching {
         val payload = json.decodeFromString<JwxtBridgePayload>(rawJson)
         val colorMap = mutableMapOf<String, Int>()
         var nextColor = 0
 
-        // 按 (课程名, 星期, 开始节次, 结束节次) 合并去重，避免教务页面重复节点导致周课数虚高与卡片堆叠
-        val mergedGroups = payload.courses
+        data class NormalizedItem(
+            val name: String,
+            val teacher: String,
+            val location: String,
+            val day: Int,
+            val start: Int,
+            val end: Int,
+            val weeks: List<Int>
+        )
+
+        val normalized = payload.courses
             .filter { it.name.isNotBlank() }
-            .groupBy { item ->
+            .map { item ->
                 val day = item.dayOfWeek.coerceIn(1, 7)
                 val start = item.startSection.coerceIn(1, 12)
                 val end = item.endSection.coerceIn(start, 12)
-                "${item.name.trim()}_${day}_${start}_${end}"
+                NormalizedItem(
+                    name = item.name.trim(),
+                    teacher = item.teacher.trim(),
+                    location = normalizeRoom(item.location),
+                    day = day,
+                    start = start,
+                    end = end,
+                    weeks = normalizeWeeks(item.weeks)
+                )
             }
+
+        // 1. 过滤同课程、同时段、同周次的“无教室”重复节点（仅当存在带真实教室的同项时）
+        val richKeys = normalized
+            .filter { it.location.isNotEmpty() }
+            .map { "${it.name}_${it.day}_${it.start}_${it.end}_${it.weeks.joinToString(",")}" }
+            .toSet()
+
+        val filtered = normalized.filter { item ->
+            if (item.location.isNotEmpty()) true
+            else "${item.name}_${item.day}_${item.start}_${item.end}_${item.weeks.joinToString(",")}" !in richKeys
+        }
+
+        // 2. 关键修复：按 (课程名, 星期, 节次, 教室) 分组合并周次！
+        //    绝对不把同一门课不同周次、不同教室（如前半学期 35-208 与后半学期/实验 36-204）错误合并成一个教室！
+        val mergedGroups = filtered.groupBy { item ->
+            "${item.name}_${item.day}_${item.start}_${item.end}_${item.location}"
+        }
 
         val entities = mergedGroups.values.map { group ->
             val first = group.first()
-            val name = first.name.trim()
-            val colorIdx = colorMap.getOrPut(name) { (nextColor++) % 8 }
+            val colorIdx = colorMap.getOrPut(first.name) { (nextColor++) % 8 }
             val mergedWeeks = group
-                .flatMap { it.weeks.ifEmpty { (1..16).toList() } }
+                .flatMap { it.weeks }
                 .filter { it in 1..30 }
                 .distinct()
                 .sorted()
                 .ifEmpty { (1..16).toList() }
 
-            val bestLocation = group
-                .map { it.location.trim() }
-                .firstOrNull { it.isNotBlank() && it != "待定教室" }
-                ?: first.location.trim()
-
             val bestTeacher = group
-                .map { it.teacher.trim() }
+                .map { it.teacher }
                 .firstOrNull { it.isNotBlank() && it != "未知教师" }
-                ?: first.teacher.trim()
-
-            val start = first.startSection.coerceIn(1, 12)
-            val end = first.endSection.coerceIn(start, 12)
+                ?: first.teacher.ifBlank { "未知教师" }
 
             CourseEntity(
-                name = name,
+                name = first.name,
                 teacher = bestTeacher,
-                location = bestLocation,
-                dayOfWeek = first.dayOfWeek.coerceIn(1, 7),
-                startSection = start,
-                endSection = end,
+                location = first.location.ifBlank { "待定教室" },
+                dayOfWeek = first.day,
+                startSection = first.start,
+                endSection = first.end,
                 weeksCsv = mergedWeeks.joinToString(","),
                 colorIndex = colorIdx
             )

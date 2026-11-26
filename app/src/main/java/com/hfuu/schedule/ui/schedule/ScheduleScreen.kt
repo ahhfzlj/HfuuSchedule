@@ -5,6 +5,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -450,7 +451,7 @@ fun ScheduleScreen(
         )
     }
 
-    // 课程详情弹窗（备忘录开启时展示本堂课关联备忘，并支持直接添加）
+    // 课程详情弹窗（备忘录开启时展示本堂课关联备忘；若该时段存在冲突课程，支持一键切换查看）
     detailCourse?.let { course ->
         val attachedMemos = remember(memos, activeWeek, course, memoEnabled) {
             if (!memoEnabled) emptyList()
@@ -461,8 +462,17 @@ fun ScheduleScreen(
                     it.endSection >= course.startSection
             }
         }
+        val conflictingCourses = remember(activeWeekCourses, course) {
+            activeWeekCourses.filter {
+                it.dayOfWeek == course.dayOfWeek &&
+                    it.startSection <= course.endSection &&
+                    it.endSection >= course.startSection
+            }
+        }
         CourseDetailDialog(
             course = course,
+            conflictingCourses = conflictingCourses,
+            onSwitchCourse = { detailCourse = it },
             timeSlots = timeSlots,
             memoEnabled = memoEnabled,
             attachedMemos = attachedMemos,
@@ -557,9 +567,78 @@ private fun deduplicateWeekCourses(
     week: Int,
     visibleDayCount: Int
 ): List<CourseEntity> {
+    // 仅去除完全重复的同一课程同一教室记录，保留所有时间冲突的不同课程或不同教室以便并排完整展示
     return courses
         .filter { it.isInWeek(week) && it.dayOfWeek in 1..visibleDayCount }
-        .distinctBy { "${it.dayOfWeek}_${it.startSection}_${it.endSection}" }
+        .sortedWith(
+            compareBy<CourseEntity> { it.startSection }
+                .thenByDescending { it.endSection }
+                .thenBy { it.location.isBlank() || it.location == "待定教室" }
+                .thenBy { it.weekList().size }
+                .thenBy { it.name }
+        )
+        .distinctBy { "${it.name.trim()}_${it.dayOfWeek}_${it.startSection}_${it.endSection}_${it.location.trim()}" }
+}
+
+private data class CourseSlotLayout(
+    val course: CourseEntity,
+    val laneIndex: Int,
+    val laneCount: Int
+)
+
+/**
+ * 为同一天内可能存在时间重叠（冲突）的课程计算并排分列布局：
+ * - 无冲突时 laneCount = 1，占满整列；
+ * - 有冲突（完全重叠或部分跨节重叠）时，将同一冲突簇按横向多列并排展示，避免任何课程被遮挡隐藏。
+ */
+private fun computeDayCourseLayouts(dayCourses: List<CourseEntity>): List<CourseSlotLayout> {
+    if (dayCourses.isEmpty()) return emptyList()
+    val sorted = dayCourses.sortedWith(
+        compareBy<CourseEntity> { it.startSection }
+            .thenByDescending { it.endSection }
+            .thenBy { it.name }
+            .thenBy { it.location }
+    )
+
+    // 1. 按重叠连通分量拆分成冲突簇
+    val clusters = mutableListOf<MutableList<CourseEntity>>()
+    var currentCluster = mutableListOf<CourseEntity>()
+    var clusterMaxEnd = -1
+    for (course in sorted) {
+        if (currentCluster.isEmpty() || course.startSection <= clusterMaxEnd) {
+            currentCluster.add(course)
+            clusterMaxEnd = maxOf(clusterMaxEnd, course.endSection)
+        } else {
+            clusters.add(currentCluster)
+            currentCluster = mutableListOf(course)
+            clusterMaxEnd = course.endSection
+        }
+    }
+    if (currentCluster.isNotEmpty()) {
+        clusters.add(currentCluster)
+    }
+
+    // 2. 在每个冲突簇内贪心分配互不重叠的横向轨道（lane）
+    val result = mutableListOf<CourseSlotLayout>()
+    for (cluster in clusters) {
+        val laneEndSections = mutableListOf<Int>()
+        val assigned = mutableListOf<Pair<CourseEntity, Int>>()
+        for (course in cluster) {
+            var targetLane = laneEndSections.indexOfFirst { lastEnd -> lastEnd < course.startSection }
+            if (targetLane == -1) {
+                targetLane = laneEndSections.size
+                laneEndSections.add(course.endSection)
+            } else {
+                laneEndSections[targetLane] = course.endSection
+            }
+            assigned.add(course to targetLane)
+        }
+        val totalLanes = laneEndSections.size.coerceAtLeast(1)
+        for ((course, lane) in assigned) {
+            result.add(CourseSlotLayout(course = course, laneIndex = lane, laneCount = totalLanes))
+        }
+    }
+    return result
 }
 
 @Composable
@@ -741,11 +820,13 @@ private fun WeekSchedulePage(
                             memo.startSection <= course.endSection && memo.endSection >= course.startSection
                         }
                     }
-                    Box(
+                    val dayCourseLayouts = remember(dayCourses) { computeDayCourseLayouts(dayCourses) }
+                    BoxWithConstraints(
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxHeight()
                     ) {
+                        val columnWidth = maxWidth
                         // 背景网格线：开启备忘录时点击空白格子可直接添加该时段备忘
                         Column(modifier = Modifier.fillMaxSize()) {
                             repeat(totalRows) { rowIdx ->
@@ -769,8 +850,13 @@ private fun WeekSchedulePage(
                             }
                         }
 
-                        // 课程色块（如本堂课有备忘，在卡片内清晰展示备忘徽标与内容预览）
-                        dayCourses.forEach { course ->
+                        // 课程色块（支持冲突课程并排完整展示，并带冲突高亮边框与角标）
+                        dayCourseLayouts.forEach { slotLayout ->
+                            val course = slotLayout.course
+                            val isConflict = slotLayout.laneCount > 1
+                            val laneWidth = columnWidth / slotLayout.laneCount
+                            val leftOffset = laneWidth * slotLayout.laneIndex
+
                             val startIdx = (course.startSection - 1).coerceIn(0, totalRows - 1)
                             val span = (course.endSection - course.startSection + 1).coerceAtLeast(1)
                             val topOffset = ROW_HEIGHT * startIdx
@@ -783,45 +869,77 @@ private fun WeekSchedulePage(
 
                             Box(
                                 modifier = Modifier
-                                    .fillMaxWidth()
-                                    .offset(y = topOffset)
+                                    .width(laneWidth)
+                                    .offset(x = leftOffset, y = topOffset)
                                     .height(cardHeight)
-                                    .padding(if (isFiveDayMode) 3.dp else 2.dp)
+                                    .padding(
+                                        horizontal = if (isConflict) 1.dp else if (isFiveDayMode) 3.dp else 2.dp,
+                                        vertical = if (isFiveDayMode) 3.dp else 2.dp
+                                    )
                                     .clip(metrics.courseShape)
                                     .background(palette.container.copy(alpha = if (isMasses) 0.94f else 1f))
                                     .then(
-                                        if (isMasses) {
-                                            Modifier.border(0.9.dp, palette.accent.copy(alpha = 0.52f), metrics.courseShape)
-                                        } else Modifier
+                                        when {
+                                            isConflict -> Modifier.border(
+                                                width = 1.dp,
+                                                color = colors.danger.copy(alpha = 0.72f),
+                                                shape = metrics.courseShape
+                                            )
+                                            isMasses -> Modifier.border(
+                                                width = 0.9.dp,
+                                                color = palette.accent.copy(alpha = 0.52f),
+                                                shape = metrics.courseShape
+                                            )
+                                            else -> Modifier
+                                        }
                                     )
                                     .clickable { onCourseClick(course) }
                             ) {
                                 Box(
                                     modifier = Modifier
-                                        .width(3.dp)
+                                        .width(if (isConflict) 2.dp else 3.dp)
                                         .fillMaxHeight()
-                                        .background(palette.accent)
+                                        .background(if (isConflict) colors.danger else palette.accent)
                                 )
                                 Column(
                                     modifier = Modifier
                                         .fillMaxSize()
                                         .padding(
-                                            start = if (isFiveDayMode) 8.dp else 6.dp,
-                                            end = if (isFiveDayMode) 6.dp else 4.dp,
-                                            top = 5.dp,
-                                            bottom = 4.dp
+                                            start = when {
+                                                isConflict -> 4.dp
+                                                isFiveDayMode -> 8.dp
+                                                else -> 6.dp
+                                            },
+                                            end = when {
+                                                isConflict -> 2.dp
+                                                isFiveDayMode -> 6.dp
+                                                else -> 4.dp
+                                            },
+                                            top = if (isConflict) 3.dp else 5.dp,
+                                            bottom = if (isConflict) 3.dp else 4.dp
                                         ),
                                     verticalArrangement = Arrangement.SpaceBetween
                                 ) {
                                     Text(
                                         text = course.name,
-                                        fontSize = if (isFiveDayMode) 12.sp else 11.sp,
-                                        lineHeight = if (isFiveDayMode) 14.5.sp else 13.sp,
+                                        fontSize = when {
+                                            isConflict && !isFiveDayMode -> 9.sp
+                                            isConflict -> 10.sp
+                                            isFiveDayMode -> 12.sp
+                                            else -> 11.sp
+                                        },
+                                        lineHeight = when {
+                                            isConflict && !isFiveDayMode -> 10.5.sp
+                                            isConflict -> 12.sp
+                                            isFiveDayMode -> 14.5.sp
+                                            else -> 13.sp
+                                        },
                                         fontWeight = if (isMasses) FontWeight.Bold else FontWeight.SemiBold,
                                         color = palette.onContainer,
                                         maxLines = when {
                                             span == 1 -> 1
                                             firstActiveMemo != null -> 2
+                                            isConflict -> 3
                                             isFiveDayMode -> 4
                                             else -> 3
                                         },
@@ -830,7 +948,7 @@ private fun WeekSchedulePage(
                                     )
 
                                     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                        if (firstActiveMemo != null) {
+                                        if (firstActiveMemo != null && !isConflict) {
                                             val allDone = courseMemos.all { it.isDone }
                                             val memoChipBg = if (allDone) colors.successBg else colors.memoBg
                                             val memoChipFg = if (allDone) colors.success else colors.memoText
@@ -864,17 +982,41 @@ private fun WeekSchedulePage(
                                             Text(
                                                 text = "@${course.location}",
                                                 fontFamily = if (isMasses) FontFamily.Monospace else FontFamily.Default,
-                                                fontSize = if (isFiveDayMode) 9.5.sp else 9.sp,
-                                                lineHeight = if (isFiveDayMode) 11.5.sp else 11.sp,
-                                                color = palette.onContainer.copy(alpha = 0.85f),
-                                                maxLines = if (firstActiveMemo != null) 1 else 2,
+                                                fontSize = when {
+                                                    isConflict && !isFiveDayMode -> 7.5.sp
+                                                    isConflict -> 8.5.sp
+                                                    isFiveDayMode -> 9.5.sp
+                                                    else -> 9.sp
+                                                },
+                                                lineHeight = when {
+                                                    isConflict -> 9.5.sp
+                                                    isFiveDayMode -> 11.5.sp
+                                                    else -> 11.sp
+                                                },
+                                                color = palette.onContainer.copy(alpha = 0.88f),
+                                                maxLines = if (firstActiveMemo != null || isConflict) 2 else 2,
                                                 overflow = TextOverflow.Ellipsis
                                             )
                                         }
                                     }
                                 }
-                                // 右上角备忘提示点 / 众生行迹角标像素
-                                if (firstActiveMemo != null) {
+                                // 右上角标识：冲突角标 > 备忘提示点 > 众生行迹角标像素
+                                if (isConflict) {
+                                    Box(
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .background(colors.danger)
+                                            .padding(horizontal = 2.dp, vertical = 0.5.dp)
+                                    ) {
+                                        Text(
+                                            text = "冲",
+                                            fontSize = 7.sp,
+                                            lineHeight = 8.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color.White
+                                        )
+                                    }
+                                } else if (firstActiveMemo != null) {
                                     Box(
                                         modifier = Modifier
                                             .align(Alignment.TopEnd)
@@ -1268,6 +1410,8 @@ private fun MemoEditorDialog(
 @Composable
 private fun CourseDetailDialog(
     course: CourseEntity,
+    conflictingCourses: List<CourseEntity>,
+    onSwitchCourse: (CourseEntity) -> Unit,
     timeSlots: List<TimeSlot>,
     memoEnabled: Boolean,
     attachedMemos: List<ScheduleMemoEntity>,
@@ -1293,13 +1437,79 @@ private fun CourseDetailDialog(
         containerColor = colors.surface,
         shape = metrics.dialogShape,
         title = {
-            Text(course.name, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(course.name, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                if (conflictingCourses.size > 1) {
+                    Text(
+                        text = "此时段共有 ${conflictingCourses.size} 门冲突课程，可点击下方切换",
+                        fontSize = 11.5.sp,
+                        color = colors.danger,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
         },
         text = {
             Column(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                if (conflictingCourses.size > 1) {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        conflictingCourses.forEach { item ->
+                            val isCurrent = item.id == course.id &&
+                                item.name == course.name &&
+                                item.location == course.location &&
+                                item.startSection == course.startSection &&
+                                item.endSection == course.endSection
+                            Surface(
+                                shape = metrics.smallCardShape,
+                                color = if (isCurrent) colors.primaryLight else colors.background,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .border(
+                                        width = if (isCurrent) 1.dp else 0.6.dp,
+                                        color = if (isCurrent) colors.primary else colors.divider,
+                                        shape = metrics.smallCardShape
+                                    )
+                                    .clickable { onSwitchCourse(item) }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = item.name,
+                                            fontSize = 13.sp,
+                                            fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium,
+                                            color = if (isCurrent) colors.primary else colors.textPrimary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = "第${item.startSection}-${item.endSection}节 · ${item.location.ifBlank { "待定教室" }}",
+                                            fontSize = 11.sp,
+                                            color = colors.textSecondary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    if (isCurrent) {
+                                        Text(
+                                            text = "当前",
+                                            fontSize = 10.5.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = colors.primary
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    HorizontalDivider(color = colors.divider)
+                }
                 DetailRow(Icons.Rounded.LocationOn, "教室", course.location.ifBlank { "未填写" })
                 DetailRow(Icons.Rounded.Person, "教师", course.teacher.ifBlank { "未填写" })
                 DetailRow(

@@ -115,8 +115,13 @@ fun AgendaScreen(
         val dow = selectedDate.dayOfWeek.value // 1=Mon .. 7=Sun
         courses
             .filter { it.dayOfWeek == dow && it.isInWeek(week) }
-            .distinctBy { "${it.dayOfWeek}_${it.startSection}_${it.endSection}" }
-            .sortedBy { it.startSection }
+            .sortedWith(
+                compareBy<CourseEntity> { it.startSection }
+                    .thenByDescending { it.endSection }
+                    .thenBy { it.location.isBlank() || it.location == "待定教室" }
+                    .thenBy { it.weekList().size }
+            )
+            .distinctBy { "${it.name.trim()}_${it.dayOfWeek}_${it.startSection}_${it.endSection}_${it.location.trim()}" }
     }
 
     // 所有开启了倒计时且尚未完成的未来日程（方便跨天也能一眼看到重要倒计时）
@@ -313,8 +318,17 @@ fun AgendaScreen(
                             englishCode = "CLASSES // ${dayCourses.size.toString().padStart(2, '0')}"
                         )
                     }
-                    items(dayCourses, key = { "course_${it.id}_${it.startSection}" }) { course ->
-                        AgendaCourseCard(course = course, timeSlots = timeSlots)
+                    items(dayCourses, key = { "course_${it.id}_${it.startSection}_${it.location}" }) { course ->
+                        val hasConflict = dayCourses.any { other ->
+                            other !== course &&
+                                other.startSection <= course.endSection &&
+                                other.endSection >= course.startSection
+                        }
+                        AgendaCourseCard(
+                            course = course,
+                            timeSlots = timeSlots,
+                            hasConflict = hasConflict
+                        )
                     }
                 }
 
@@ -870,7 +884,8 @@ private fun AgendaEventCard(
 @Composable
 private fun AgendaCourseCard(
     course: CourseEntity,
-    timeSlots: List<TimeSlot>
+    timeSlots: List<TimeSlot>,
+    hasConflict: Boolean = false
 ) {
     val colors = AppTheme.colors
     val isMasses = AppTheme.isMasses
@@ -879,8 +894,8 @@ private fun AgendaCourseCard(
     val endTime = timeSlots.find { it.section == course.endSection }?.endTime ?: "第${course.endSection}节"
 
     ThemedCard(
-        accentColor = if (isMasses) palette.accent else null,
-        indexTag = if (isMasses) "SEC ${course.startSection}-${course.endSection}" else null
+        accentColor = if (isMasses) (if (hasConflict) MassesCrimson else palette.accent) else null,
+        indexTag = if (isMasses) (if (hasConflict) "CONFLICT // SEC ${course.startSection}-${course.endSection}" else "SEC ${course.startSection}-${course.endSection}") else null
     ) {
         Row(
             modifier = Modifier
@@ -894,7 +909,7 @@ private fun AgendaCourseCard(
                         .width(4.dp)
                         .height(36.dp)
                         .clip(RoundedCornerShape(2.dp))
-                        .background(palette.accent)
+                        .background(if (hasConflict) colors.danger else palette.accent)
                 )
                 Spacer(Modifier.width(12.dp))
             } else {
@@ -902,14 +917,32 @@ private fun AgendaCourseCard(
             }
 
             Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = course.name,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = colors.textPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = course.name,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = colors.textPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (hasConflict) {
+                        Text(
+                            text = "冲突",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = colors.danger,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(if (isMasses) 2.dp else 6.dp))
+                                .background(colors.dangerBg)
+                                .padding(horizontal = 5.dp, vertical = 1.dp)
+                        )
+                    }
+                }
                 Spacer(Modifier.height(2.dp))
                 val meta = buildList {
                     add("第${course.startSection}-${course.endSection}节 ($startTime - $endTime)")
